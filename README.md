@@ -1,6 +1,6 @@
 # paperless-ngx companion (OCR webhook)
 
-English | 中文
+English | [中文](https://github.com/fr0der1c/paperless-ngx-companion?tab=readme-ov-file#%E6%A6%82%E8%BF%B0)
 
 ## Overview
 Paperless-ngx is a great self-hosted DMS, but its built-in Tesseract OCR can be limited. PaddleOCR offers stronger recognition, and an LLM can produce better titles and fix OCR formatting issues. This project uses Paperless-ngx native Workflow + Webhook to attach external OCR and overwrite the built-in OCR result.
