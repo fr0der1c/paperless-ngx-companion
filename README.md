@@ -87,7 +87,7 @@ This project uses `pyproject.toml` + `uv.lock` as the single source of truth for
 
 ### General LLM Defaults
 - `LLM_API_BASE`: default OpenAI-compatible base URL, default `https://api.openai.com/v1`
-- `LLM_MODEL`: default model name, default `gpt-4.1-2025-04-14`
+- `LLM_MODEL`: default model name, default `gpt-5.5`
 
 ### OCR-Specific Overrides
 - `LLM_OCR_API_BASE`: optional dedicated OCR base URL
@@ -128,7 +128,7 @@ docker run -p 8000:8000 \
   -e PAPERLESS_API_TOKEN=YOUR_TOKEN \
   -e LLM_API_BASE=https://api.openai.com/v1 \
   -e LLM_API_KEY=YOUR_LLM_KEY \
-  -e LLM_MODEL=gpt-4.1-2025-04-14 \
+  -e LLM_MODEL=gpt-5.5 \
   paperless-ngx-companion
 ```
 
@@ -291,7 +291,7 @@ Paperless-ngx 本身已经很好用，但如果你想要的是：
 
 ### 全局默认模型配置
 - `LLM_API_BASE`：默认 OpenAI-compatible Base URL，默认 `https://api.openai.com/v1`
-- `LLM_MODEL`：默认模型名，默认 `gpt-4.1-2025-04-14`
+- `LLM_MODEL`：默认模型名，默认 `gpt-5.5`
 
 ### OCR 专用覆盖配置
 - `LLM_OCR_API_BASE`：可选，OCR 专用 Base URL
@@ -332,7 +332,7 @@ docker run -p 8000:8000 \
   -e PAPERLESS_API_TOKEN=YOUR_TOKEN \
   -e LLM_API_BASE=https://api.openai.com/v1 \
   -e LLM_API_KEY=YOUR_LLM_KEY \
-  -e LLM_MODEL=gpt-4.1-2025-04-14 \
+  -e LLM_MODEL=gpt-5.5 \
   paperless-ngx-companion
 ```
 

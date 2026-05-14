@@ -25,7 +25,7 @@ PAPERLESS_PAGE_SIZE = int(os.getenv("PAPERLESS_PAGE_SIZE", "1000"))
 
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.openai.com/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-2025-04-14")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.5")
 
 LLM_OCR_API_BASE = os.getenv("LLM_OCR_API_BASE", "").rstrip("/")
 LLM_OCR_API_KEY = os.getenv("LLM_OCR_API_KEY", "")
