@@ -57,6 +57,8 @@ networks:
     external: true
 ```
 
+You need to replace `PAPERLESS_API_TOKEN` and `LLM_API_KEY` with your actual values.
+
 Then create a workflow in Paperless-ngx:
 
 1. Trigger: **Document Added**
@@ -160,6 +162,8 @@ networks:
   paperless:
     external: true
 ```
+
+你需要将 PAPERLESS_API_TOKEN、LLM_API_KEY 替换为实际值。
 
 然后在 Paperless-ngx 里新建一个 Workflow：
 
