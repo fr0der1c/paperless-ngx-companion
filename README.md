@@ -58,19 +58,17 @@ Then create a workflow in Paperless-ngx:
 1. Trigger: **Document Added**
 2. Action: **Webhook**
 3. URL: `http://ocr-service:8000/paperless-webhook`
-4. Do not enable `Use parameters as webhook payload`
+4. Enable `Use parameters as webhook payload`
 5. Enable `Send webhook payload as JSON`
-6. Set the webhook payload to:
+6. Add one webhook parameter:
 
-```json
-{
-  "doc_url": "{{ doc_url }}"
-}
-```
+| Name | Value |
+| --- | --- |
+| `doc_url` | `{{doc_url}}` |
 
 7. Turn off `Add document`.
 
-`{{ doc_url }}` requires `PAPERLESS_URL` to be configured in Paperless-ngx.
+`{{doc_url}}` requires `PAPERLESS_URL` to be configured in Paperless-ngx.
 
 After that, newly added documents will go through the external OCR pipeline automatically.
 
@@ -165,19 +163,17 @@ services:
 1. Trigger: **Document Added**
 2. Action: **Webhook**
 3. URL: `http://ocr-service:8000/paperless-webhook`
-4. 不要打开 `使用参数作为 webhook 负载`
+4. 打开 `使用参数作为 webhook 负载`
 5. 打开 `以 JSON 格式发送网络钩子的有效负载`
-6. 将 webhook payload 设置为：
+6. 在 `Webhook 参数` 里添加一项：
 
-```json
-{
-  "doc_url": "{{ doc_url }}"
-}
-```
+| 名称 | 值 |
+| --- | --- |
+| `doc_url` | `{{doc_url}}` |
 
 7. 关闭 `添加文档`。
 
-`{{ doc_url }}` 依赖 Paperless-ngx 的 `PAPERLESS_URL` 配置。
+`{{doc_url}}` 依赖 Paperless-ngx 的 `PAPERLESS_URL` 配置。
 
 如果你希望 OCR 和后续抽取分别使用不同的模型接口，还可以额外配置：
 
