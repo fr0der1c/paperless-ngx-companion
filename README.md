@@ -34,7 +34,7 @@ This project avoids that by doing everything in one webhook request and then upd
 
 ## Installation
 
-Add this service to your existing Paperless-ngx docker-compose file, and make sure it is on the same network as Paperless:
+Add this service to your existing Paperless-ngx docker-compose file:
 
 ```yaml
 services:
@@ -49,12 +49,6 @@ services:
     depends_on:
       - webserver
     restart: unless-stopped
-    networks:
-      - paperless
-
-networks:
-  paperless:
-    external: true
 ```
 
 You need to replace `PAPERLESS_API_TOKEN` and `LLM_API_KEY` with your actual values.
@@ -63,14 +57,17 @@ Then create a workflow in Paperless-ngx:
 
 1. Trigger: **Document Added**
 2. Action: **Webhook**
-3. URL: `http://<host>:8000/paperless-webhook`
-4. JSON body:
+3. URL: `http://ocr-service:8000/paperless-webhook`
+4. Enable `Use parameters as webhook payload`
+5. Enable `Send webhook payload as JSON`
+6. Add one webhook parameter:
 
-```json
-{
-  "doc_url": "{{doc_url}}"
-}
-```
+| Name | Value |
+| --- | --- |
+| `doc_url` | `{{doc_url}}` |
+
+7. `Add document` is not required for this project, because the service downloads the original file from Paperless-ngx by itself.
+
 
 After that, newly added documents will go through the external OCR pipeline automatically.
 
@@ -140,7 +137,7 @@ uv run python local_ocr_test.py /path/to/file.pdf
 
 ## 安装
 
-把这个服务加到你现有的 Paperless-ngx docker-compose 里，并确保它和 Paperless 在同一个网络中：
+把这个服务加到你现有的 Paperless-ngx docker-compose 里：
 
 ```yaml
 services:
@@ -155,12 +152,7 @@ services:
     depends_on:
       - webserver
     restart: unless-stopped
-    networks:
-      - paperless
 
-networks:
-  paperless:
-    external: true
 ```
 
 你需要将 PAPERLESS_API_TOKEN、LLM_API_KEY 替换为实际值。
@@ -169,14 +161,17 @@ networks:
 
 1. Trigger: **Document Added**
 2. Action: **Webhook**
-3. URL: `http://<host>:8000/paperless-webhook`
-4. Body 使用下面这段 JSON：
+3. URL: `http://ocr-service:8000/paperless-webhook`
+4. 打开 `使用参数作为 webhook 负载`
+5. 打开 `以 JSON 格式发送网络钩子的有效负载`
+6. 在 `Webhook 参数` 里添加一项：
 
-```json
-{
-  "doc_url": "{{doc_url}}"
-}
-```
+| 名称 | 值 |
+| --- | --- |
+| `doc_url` | `{{doc_url}}` |
+
+7. `添加文档` 对这个项目不是必需的，因为服务会自己再去 Paperless-ngx 下载原始文件。
+
 
 如果你希望 OCR 和后续抽取分别使用不同的模型接口，还可以额外配置：
 
