@@ -64,10 +64,9 @@ Then create a workflow in Paperless-ngx:
 
 | Name | Value |
 | --- | --- |
-| `doc_url` | `{{doc_url}}` |
+| `doc_id` | `{{doc_id}}` |
 
 7. `Add document` is not required for this project, because the service downloads the original file from Paperless-ngx by itself.
-
 
 After that, newly added documents will go through the external OCR pipeline automatically.
 
@@ -168,10 +167,9 @@ services:
 
 | 名称 | 值 |
 | --- | --- |
-| `doc_url` | `{{doc_url}}` |
+| `doc_id` | `{{doc_id}}` |
 
 7. `添加文档` 对这个项目不是必需的，因为服务会自己再去 Paperless-ngx 下载原始文件。
-
 
 如果你希望 OCR 和后续抽取分别使用不同的模型接口，还可以额外配置：
 

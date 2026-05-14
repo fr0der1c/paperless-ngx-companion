@@ -156,21 +156,18 @@ def _paperless_headers() -> dict[str, str]:
     return {"Authorization": f"Token {PAPERLESS_API_TOKEN}"}
 
 
-def _extract_doc_id(doc_url: str | None) -> int | None:
-    if not doc_url:
-        return None
-    match = re.search(r"/documents/(\d+)/", doc_url)
-    if not match:
-        return None
-    return int(match.group(1))
+def _coerce_optional_int(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
-def _coerce_optional_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        cleaned = value.strip()
-        return cleaned or None
+def _extract_doc_id_from_payload(payload: dict[str, Any]) -> int | None:
+    doc_id = _coerce_optional_int(payload.get("doc_id"))
+    if doc_id and doc_id > 0:
+        return doc_id
     return None
 
 
@@ -248,13 +245,9 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
         logger.info("Webhook payload parsed as form keys=%s", sorted(form_payload.keys()))
         return form_payload
 
-    if body_text.startswith("http://") or body_text.startswith("https://"):
-        logger.info("Webhook payload parsed as raw_url")
-        return {"doc_url": body_text}
-
     raise HTTPException(
         status_code=400,
-        detail="webhook payload must be JSON, form-encoded, or a raw document URL",
+        detail="webhook payload must be JSON or form-encoded with doc_id",
     )
 
 
@@ -728,14 +721,15 @@ async def healthz() -> dict[str, str]:
 async def paperless_webhook(request: Request) -> JSONResponse:
     _require_client()
     body = await _parse_webhook_payload(request)
-    doc_url = _coerce_optional_string(body.get("doc_url")) or _coerce_optional_string(
-        body.get("url")
-    )
-    doc_id = _extract_doc_id(doc_url)
+    doc_id = _extract_doc_id_from_payload(body)
     if not doc_id:
-        raise HTTPException(status_code=400, detail="doc_id not found")
+        logger.warning("doc_id not found in webhook payload keys=%s", sorted(body.keys()))
+        raise HTTPException(
+            status_code=400,
+            detail="doc_id not found; configure Paperless webhook parameter doc_id={{doc_id}}",
+        )
 
-    logger.info("Webhook received doc_id=%s doc_url=%s", doc_id, doc_url)
+    logger.info("Webhook received doc_id=%s", doc_id)
     try:
         file_bytes, content_type = await _download_document(doc_id)
         images = _images_from_bytes(file_bytes, content_type)
