@@ -185,6 +185,12 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
     if not body_text:
         raise HTTPException(status_code=400, detail="webhook payload is empty")
 
+    logger.info(
+        "Webhook payload received content_type=%s body_preview=%s",
+        content_type or "<empty>",
+        _preview(body_text),
+    )
+
     if content_type == "application/json" or body_text.startswith("{"):
         try:
             payload = json.loads(body_text)
@@ -196,6 +202,7 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
             )
         else:
             if isinstance(payload, dict):
+                logger.info("Webhook payload parsed as json keys=%s", sorted(payload.keys()))
                 return payload
             raise HTTPException(status_code=400, detail="webhook JSON payload must be an object")
 
@@ -204,9 +211,11 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
         for key, values in parse_qs(body_text, keep_blank_values=True).items()
     }
     if form_payload:
+        logger.info("Webhook payload parsed as form keys=%s", sorted(form_payload.keys()))
         return form_payload
 
     if body_text.startswith("http://") or body_text.startswith("https://"):
+        logger.info("Webhook payload parsed as raw_url")
         return {"doc_url": body_text}
 
     raise HTTPException(
