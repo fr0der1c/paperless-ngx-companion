@@ -33,12 +33,13 @@ For this project, the issue is not "add some AI somewhere", but "complete OCR an
 This project avoids that by doing everything in one webhook request and then updating Paperless-ngx once with the final result.
 
 ## Installation
+
 Add this service to your existing Paperless-ngx docker-compose file, and make sure it is on the same network as Paperless:
 
 ```yaml
 services:
   ocr-service:
-    build: .
+    image: fr0der1c/paperless-ocr:latest
     environment:
       PAPERLESS_BASE_URL: http://webserver:8000
       PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
@@ -136,12 +137,13 @@ uv run python local_ocr_test.py /path/to/file.pdf
 这个项目的做法更直接：在一次 webhook 请求里完成所有处理，然后只对 Paperless-ngx 做一次最终更新。
 
 ## 安装
+
 把这个服务加到你现有的 Paperless-ngx docker-compose 里，并确保它和 Paperless 在同一个网络中：
 
 ```yaml
 services:
   ocr-service:
-    build: .
+    image: fr0der1c/paperless-ocr:latest
     environment:
       PAPERLESS_BASE_URL: http://webserver:8000
       PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
