@@ -1,6 +1,6 @@
 # paperless-ngx companion
 
-English | 中文
+[English](#paperless-ngx-companion) | [中文](#paperless-ngx-companion-1)
 
 ## What is this
 `paperless-ngx companion` is a small FastAPI service that uses Paperless-ngx Workflow + Webhook to transparently replace the built-in OCR flow with a multimodal LLM pipeline.
