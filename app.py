@@ -175,8 +175,41 @@ def _coerce_optional_string(value: Any) -> str | None:
 
 
 async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
-    raw_body = await request.body()
     content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    content_length = request.headers.get("content-length") or "unknown"
+
+    if content_type in {"multipart/form-data", "application/x-www-form-urlencoded"}:
+        try:
+            form = await request.form()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to parse form webhook payload content_type=%s content_length=%s error=%s",
+                content_type,
+                content_length,
+                exc,
+            )
+            raise HTTPException(status_code=400, detail="invalid form webhook payload") from exc
+
+        payload: dict[str, Any] = {}
+        file_keys: list[str] = []
+        for key, value in form.multi_items():
+            if isinstance(value, str):
+                payload[key] = value
+                continue
+            file_keys.append(key)
+
+        logger.info(
+            "Webhook payload parsed as form content_type=%s content_length=%s field_keys=%s file_keys=%s",
+            content_type,
+            content_length,
+            sorted(payload.keys()),
+            sorted(set(file_keys)),
+        )
+        if payload:
+            return payload
+        raise HTTPException(status_code=400, detail="webhook form payload has no text fields")
+
+    raw_body = await request.body()
 
     if not raw_body:
         raise HTTPException(status_code=400, detail="webhook payload is empty")
@@ -186,8 +219,9 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="webhook payload is empty")
 
     logger.info(
-        "Webhook payload received content_type=%s body_preview=%s",
+        "Webhook payload received content_type=%s content_length=%s body_preview=%s",
         content_type or "<empty>",
+        content_length,
         _preview(body_text),
     )
 
