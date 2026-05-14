@@ -1,27 +1,27 @@
 FROM python:3.10-slim
 
-ENV PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+COPY --from=ghcr.io/astral-sh/uv:0.9.13 /uv /uvx /bin/
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_NO_DEV=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        poppler-utils \
-       libgl1 \
-       libglib2.0-0 \
-       swig \
-       build-essential \
-       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m appuser
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project
 
-COPY app.py .
+COPY app.py local_ocr_test.py ./
 
 RUN chown -R appuser /app /home/appuser
 USER appuser

@@ -1,39 +1,70 @@
 import asyncio
+import base64
 import io
+import json
 import logging
 import os
 import re
-from typing import Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 import httpx
-import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from paddleocr import PaddleOCR
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageOps
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PAPERLESS_BASE_URL = os.getenv("PAPERLESS_BASE_URL", "").rstrip("/")
 PAPERLESS_API_TOKEN = os.getenv("PAPERLESS_API_TOKEN", "")
-PAPERLESS_LANG = os.getenv("PAPERLESS_LANG", "ch")
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+LLM_REQUEST_TIMEOUT = int(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
 MAX_TITLE_LENGTH = 80
 CONTENT_LOG_PREVIEW_CHARS = 200
-LLM_ENABLED = os.getenv("LLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+PAPERLESS_PAGE_SIZE = int(os.getenv("PAPERLESS_PAGE_SIZE", "1000"))
+
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.openai.com/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-2025-04-14")
-LLM_INPUT_CHAR_LIMIT = 4000
-LLM_FORMAT_CONTENT = os.getenv("LLM_FORMAT_CONTENT", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LLM_FORMAT_INPUT_CHAR_LIMIT = 6000
+
+LLM_OCR_API_BASE = os.getenv("LLM_OCR_API_BASE", "").rstrip("/")
+LLM_OCR_API_KEY = os.getenv("LLM_OCR_API_KEY", "")
+LLM_OCR_MODEL = os.getenv("LLM_OCR_MODEL", "")
+LLM_OCR_MAX_TOKENS = int(os.getenv("LLM_OCR_MAX_TOKENS", "4096"))
+LLM_OCR_IMAGE_MAX_SIZE = int(os.getenv("LLM_OCR_IMAGE_MAX_SIZE", "2048"))
+LLM_OCR_IMAGE_DETAIL = os.getenv("LLM_OCR_IMAGE_DETAIL", "high")
+
+LLM_EXTRACT_API_BASE = os.getenv("LLM_EXTRACT_API_BASE", "").rstrip("/")
+LLM_EXTRACT_API_KEY = os.getenv("LLM_EXTRACT_API_KEY", "")
+LLM_EXTRACT_MODEL = os.getenv("LLM_EXTRACT_MODEL", "")
+LLM_EXTRACT_INPUT_CHAR_LIMIT = int(os.getenv("LLM_EXTRACT_INPUT_CHAR_LIMIT", "12000"))
+LLM_EXTRACT_MAX_TOKENS = int(os.getenv("LLM_EXTRACT_MAX_TOKENS", "1200"))
+
+LLM_PAGE_CONCURRENCY = max(1, int(os.getenv("LLM_PAGE_CONCURRENCY", "2")))
+LLM_MAX_PAGES = int(os.getenv("LLM_MAX_PAGES", "20"))
 
 logger = logging.getLogger("paperless_ocr")
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    purpose: str
+    base_url: str
+    api_key: str
+    model: str
+
+
+@dataclass(frozen=True)
+class NamedEntity:
+    entity_id: int
+    name: str
+
+
+@dataclass(frozen=True)
+class MetadataExtraction:
+    title: str | None
+    tags: list[str]
+    document_type: str | None
 
 
 def _configure_logging() -> None:
@@ -51,6 +82,34 @@ def _configure_logging() -> None:
     logger.propagate = True
 
 
+def _resolve_llm_config(
+    purpose: str,
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+) -> LLMConfig:
+    return LLMConfig(
+        purpose=purpose,
+        base_url=base_url or LLM_API_BASE,
+        api_key=api_key or LLM_API_KEY,
+        model=model or LLM_MODEL,
+    )
+
+
+OCR_LLM_CONFIG = _resolve_llm_config(
+    "ocr",
+    base_url=LLM_OCR_API_BASE,
+    api_key=LLM_OCR_API_KEY,
+    model=LLM_OCR_MODEL,
+)
+EXTRACT_LLM_CONFIG = _resolve_llm_config(
+    "extract",
+    base_url=LLM_EXTRACT_API_BASE,
+    api_key=LLM_EXTRACT_API_KEY,
+    model=LLM_EXTRACT_MODEL,
+)
+
 _configure_logging()
 
 if not PAPERLESS_BASE_URL or not PAPERLESS_API_TOKEN:
@@ -60,7 +119,40 @@ if not PAPERLESS_BASE_URL or not PAPERLESS_API_TOKEN:
 
 app = FastAPI()
 client: httpx.AsyncClient | None = None
-ocr_engine: PaddleOCR | None = None
+
+
+def _require_client() -> httpx.AsyncClient:
+    if not client:
+        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    return client
+
+
+def _require_paperless_config() -> None:
+    if not PAPERLESS_BASE_URL or not PAPERLESS_API_TOKEN:
+        raise HTTPException(status_code=500, detail="Paperless API config missing")
+
+
+def _require_llm_config(config: LLMConfig) -> None:
+    missing: list[str] = []
+    if not config.base_url:
+        missing.append("LLM_API_BASE")
+    if not config.api_key:
+        missing.append(
+            "LLM_API_KEY"
+            if config.purpose == "extract" and not LLM_EXTRACT_API_KEY
+            else f"LLM_{config.purpose.upper()}_API_KEY"
+        )
+    if not config.model:
+        missing.append("LLM_MODEL")
+    if missing:
+        raise RuntimeError(
+            f"Missing LLM config for {config.purpose}: {', '.join(sorted(set(missing)))}"
+        )
+
+
+def _paperless_headers() -> dict[str, str]:
+    _require_paperless_config()
+    return {"Authorization": f"Token {PAPERLESS_API_TOKEN}"}
 
 
 def _extract_doc_id(doc_url: str | None) -> int | None:
@@ -73,16 +165,84 @@ def _extract_doc_id(doc_url: str | None) -> int | None:
 
 
 async def _download_document(doc_id: int) -> tuple[bytes, str]:
-    if not client:
-        raise HTTPException(status_code=503, detail="HTTP client not ready")
-    if not PAPERLESS_BASE_URL or not PAPERLESS_API_TOKEN:
-        raise HTTPException(status_code=500, detail="Paperless API config missing")
     url = f"{PAPERLESS_BASE_URL}/api/documents/{doc_id}/download/?original=true"
-    headers = {"Authorization": f"Token {PAPERLESS_API_TOKEN}"}
-    resp = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp = await _require_client().get(
+        url,
+        headers=_paperless_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
     resp.raise_for_status()
-    content_type = resp.headers.get("content-type", "")
-    return resp.content, content_type
+    return resp.content, resp.headers.get("content-type", "")
+
+
+async def _get_document_details(doc_id: int) -> dict[str, Any]:
+    url = f"{PAPERLESS_BASE_URL}/api/documents/{doc_id}/"
+    resp = await _require_client().get(
+        url,
+        headers=_paperless_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected document payload from Paperless")
+    return data
+
+
+async def _list_paginated(endpoint: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    next_url = f"{PAPERLESS_BASE_URL}{endpoint}"
+    params: dict[str, Any] | None = {"page_size": PAPERLESS_PAGE_SIZE}
+
+    while next_url:
+        resp = await _require_client().get(
+            next_url,
+            headers=_paperless_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    items.append(item)
+            break
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected list payload from {endpoint}")
+
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError(f"Missing results in paginated payload from {endpoint}")
+
+        for item in results:
+            if isinstance(item, dict):
+                items.append(item)
+
+        next_url = data.get("next")
+        params = None
+
+    return items
+
+
+def _to_named_entities(items: list[dict[str, Any]]) -> list[NamedEntity]:
+    entities: list[NamedEntity] = []
+    for item in items:
+        entity_id = item.get("id")
+        name = item.get("name")
+        if isinstance(entity_id, int) and isinstance(name, str) and name.strip():
+            entities.append(NamedEntity(entity_id=entity_id, name=name.strip()))
+    return entities
+
+
+async def _list_existing_tags() -> list[NamedEntity]:
+    return _to_named_entities(await _list_paginated("/api/tags/"))
+
+
+async def _list_existing_document_types() -> list[NamedEntity]:
+    return _to_named_entities(await _list_paginated("/api/document_types/"))
 
 
 def _is_pdf(data: bytes, content_type: str) -> bool:
@@ -94,31 +254,35 @@ def _is_pdf(data: bytes, content_type: str) -> bool:
 def _images_from_bytes(data: bytes, content_type: str) -> list[Image.Image]:
     if _is_pdf(data, content_type):
         return convert_from_bytes(data)
-    return [Image.open(io.BytesIO(data))]
+
+    image = Image.open(io.BytesIO(data))
+    image.load()
+    return [image]
 
 
-def _ocr_image(img: Image.Image) -> list[str]:
-    if not ocr_engine:
-        raise RuntimeError("OCR engine not initialized")
-    result = ocr_engine.ocr(np.array(img), cls=True)
-    texts: list[str] = []
-    for line in result:
-        for _box, (txt, _score) in line:
-            cleaned = txt.strip()
-            if cleaned:
-                texts.append(cleaned)
-    return texts
+def _prepare_image_for_llm(img: Image.Image) -> str:
+    image = ImageOps.exif_transpose(img)
+    if image.mode in {"RGBA", "LA"}:
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        alpha = image.getchannel("A")
+        background.paste(image.convert("RGB"), mask=alpha)
+        image = background
+    elif image.mode != "RGB":
+        image = image.convert("RGB")
 
+    width, height = image.size
+    longest_edge = max(width, height)
+    if LLM_OCR_IMAGE_MAX_SIZE > 0 and longest_edge > LLM_OCR_IMAGE_MAX_SIZE:
+        scale = LLM_OCR_IMAGE_MAX_SIZE / longest_edge
+        image = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
 
-def _build_content(texts: Iterable[str]) -> str:
-    return "\n".join(texts)
-
-
-def _build_title(texts: Sequence[str]) -> str | None:
-    for txt in texts:
-        if txt:
-            return txt[:MAX_TITLE_LENGTH]
-    return None
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def _preview(text: str, limit: int = CONTENT_LOG_PREVIEW_CHARS) -> str:
@@ -127,138 +291,330 @@ def _preview(text: str, limit: int = CONTENT_LOG_PREVIEW_CHARS) -> str:
     return text[:limit] + "..."
 
 
-async def _generate_title_with_llm(content: str) -> str | None:
-    if not LLM_ENABLED:
-        logger.info("LLM disabled; skip LLM title")
+def _sanitize_title(title: str | None) -> str | None:
+    if not title:
         return None
-    if not LLM_API_KEY:
-        logger.warning("LLM enabled but LLM_API_KEY missing; skip LLM title")
+    cleaned = re.sub(r"\s+", " ", title).strip().strip("\"'`")
+    if not cleaned:
         return None
+    return cleaned[:MAX_TITLE_LENGTH]
+
+
+def _build_fallback_title(content: str) -> str | None:
+    for line in content.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip()
+        if cleaned:
+            return cleaned[:MAX_TITLE_LENGTH]
+    return None
+
+
+def _build_content(page_texts: Sequence[str]) -> str:
+    pages = [page.strip() for page in page_texts if page.strip()]
+    return "\n\n".join(pages)
+
+
+def _extract_message_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("LLM response missing choices")
+
+    message = choices[0].get("message", {})
+    if not isinstance(message, dict):
+        raise RuntimeError("LLM response missing message")
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        texts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+        joined = "\n".join(texts).strip()
+        if joined:
+            return joined
+
+    raise RuntimeError("LLM response content is empty")
+
+
+def _strip_json_fence(text: str) -> str:
+    fenced = text.strip()
+    if fenced.startswith("```"):
+        fenced = re.sub(r"^```(?:json)?\s*", "", fenced)
+        fenced = re.sub(r"\s*```$", "", fenced)
+    return fenced.strip()
+
+
+async def _call_chat_completion(
+    config: LLMConfig,
+    *,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    _require_llm_config(config)
+    url = f"{config.base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": config.model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    resp = await _require_client().post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=LLM_REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("LLM response must be a JSON object")
+    return _extract_message_content(data)
+
+
+async def _ocr_page_with_llm(img: Image.Image, page_index: int) -> str:
+    image_url = _prepare_image_for_llm(img)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an OCR engine. Transcribe the document page exactly in reading order. "
+                "Do not summarize, explain, classify, or add missing information. "
+                "Return plain text only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Please OCR page {page_index}. "
+                        "Preserve visible wording as faithfully as possible."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url,
+                        "detail": LLM_OCR_IMAGE_DETAIL,
+                    },
+                },
+            ],
+        },
+    ]
+    return await _call_chat_completion(
+        OCR_LLM_CONFIG,
+        messages=messages,
+        max_tokens=LLM_OCR_MAX_TOKENS,
+        temperature=0.0,
+    )
+
+
+async def _ocr_images_with_llm(images: Sequence[Image.Image]) -> list[str]:
+    if not images:
+        return []
+    if LLM_MAX_PAGES > 0 and len(images) > LLM_MAX_PAGES:
+        raise RuntimeError(
+            f"Document has {len(images)} pages, exceeds LLM_MAX_PAGES={LLM_MAX_PAGES}"
+        )
+
+    semaphore = asyncio.Semaphore(LLM_PAGE_CONCURRENCY)
+
+    async def _run_one(index: int, image: Image.Image) -> str:
+        async with semaphore:
+            logger.info("Start LLM OCR page=%s", index)
+            text = await _ocr_page_with_llm(image, index)
+            logger.info("Finished LLM OCR page=%s chars=%s", index, len(text))
+            return text.strip()
+
+    tasks = [
+        asyncio.create_task(_run_one(index, image))
+        for index, image in enumerate(images, start=1)
+    ]
+    return await asyncio.gather(*tasks)
+
+
+async def _extract_metadata_with_llm(
+    content: str,
+    allowed_tags: Sequence[NamedEntity],
+    allowed_document_types: Sequence[NamedEntity],
+) -> MetadataExtraction:
     if not content.strip():
-        logger.info("content is empty; skip LLM title")
-        return None
-    text = content[:LLM_INPUT_CHAR_LIMIT]
-    url = f"{LLM_API_BASE}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
+        return MetadataExtraction(title=None, tags=[], document_type=None)
+
+    text = content[:LLM_EXTRACT_INPUT_CHAR_LIMIT]
+    tag_names = [item.name for item in allowed_tags]
+    document_type_names = [item.name for item in allowed_document_types]
+    schema_hint = {
+        "title": "string or null",
+        "tags": ["must be chosen from allowed_tags only"],
+        "document_type": "string or null, must be chosen from allowed_document_types only",
     }
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You generate a concise document title (max 80 chars) for OCR-extracted text. "
-                    "If there is already a title in the text, use it as the title. "
-                    "OCR output may contain recognition errors or broken line breaks; infer and fix them. "
-                    "Return only the title without quotes."
-                ),
-            },
-            {"role": "user", "content": text},
-        ],
-        "max_tokens": MAX_TITLE_LENGTH + 20,
-        "temperature": 0.2,
-    }
-    try:
-        resp = await client.post(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        choice = data.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        title = (message.get("content") or "").strip()
-        if not title:
-            return None
-        return title[:MAX_TITLE_LENGTH]
-    except httpx.HTTPError as exc:
-        logger.warning("LLM title generation failed: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("LLM title generation error: %s", exc)
-    return None
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Extract metadata from OCR text. "
+                "Return a JSON object only. "
+                "Choose tags only from allowed_tags. "
+                "Choose document_type only from allowed_document_types. "
+                "If no tag is suitable, return an empty array. "
+                "If no document type is suitable, return null. "
+                "Do not invent labels."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "allowed_tags": tag_names,
+                    "allowed_document_types": document_type_names,
+                    "output_schema": schema_hint,
+                    "ocr_text": text,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    raw = await _call_chat_completion(
+        EXTRACT_LLM_CONFIG,
+        messages=messages,
+        max_tokens=LLM_EXTRACT_MAX_TOKENS,
+        temperature=0.0,
+    )
+    payload = json.loads(_strip_json_fence(raw))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Metadata extraction response must be a JSON object")
+
+    raw_title = payload.get("title")
+    raw_tags = payload.get("tags")
+    raw_document_type = payload.get("document_type")
+
+    tags: list[str] = []
+    if isinstance(raw_tags, list):
+        for item in raw_tags:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip()
+            if cleaned and cleaned not in tags:
+                tags.append(cleaned)
+
+    return MetadataExtraction(
+        title=_sanitize_title(raw_title if isinstance(raw_title, str) else None),
+        tags=tags,
+        document_type=(
+            raw_document_type.strip()
+            if isinstance(raw_document_type, str) and raw_document_type.strip()
+            else None
+        ),
+    )
 
 
-async def _format_content_with_llm(content: str) -> str | None:
-    if not LLM_ENABLED or not LLM_FORMAT_CONTENT:
-        return None
-    if not LLM_API_KEY:
-        logger.warning("LLM formatting enabled but LLM_API_KEY missing; skip format")
-        return None
-    text = content.strip()
-    if not text:
-        return None
-    text = text[:LLM_FORMAT_INPUT_CHAR_LIMIT]
-    url = f"{LLM_API_BASE}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "The following is OCR-extracted text with formatting issues. "
-                    "Restore the original text layout without changing any wording; "
-                    "preserve the exact wording. Output in plain text only. "
-                    "Output only the text, add nothing else."
-                ),
-            },
-            {"role": "user", "content": text},
-        ],
-        "max_tokens": min(len(text) // 2 + 200, 1500),
-        "temperature": 0.0,
-    }
-    try:
-        resp = await client.post(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        choice = data.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        formatted = (message.get("content") or "").strip()
-        if not formatted:
-            return None
-        ratio = len(formatted) / max(len(text), 1)
-        if ratio < 0.5 or ratio > 2.0:
-            logger.warning(
-                "LLM formatting rejected due to length ratio (%.2f); fallback to raw",
-                ratio,
-            )
-            return None
-        return formatted
-    except httpx.HTTPError as exc:
-        logger.warning("LLM formatting call failed: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("LLM formatting error: %s", exc)
-    return None
+def _build_name_index(entities: Sequence[NamedEntity]) -> dict[str, NamedEntity]:
+    index: dict[str, NamedEntity] = {}
+    for entity in entities:
+        key = entity.name.strip().casefold()
+        if key and key not in index:
+            index[key] = entity
+    return index
 
-async def _update_document(doc_id: int, content: str, title: str | None) -> None:
-    if not client:
-        raise HTTPException(status_code=503, detail="HTTP client not ready")
-    if not PAPERLESS_BASE_URL or not PAPERLESS_API_TOKEN:
-        raise HTTPException(status_code=500, detail="Paperless API config missing")
+
+def _validate_selected_tags(
+    selected_names: Sequence[str],
+    allowed_tags: Sequence[NamedEntity],
+) -> list[int]:
+    allowed_index = _build_name_index(allowed_tags)
+    validated_ids: list[int] = []
+    seen: set[int] = set()
+    for name in selected_names:
+        entity = allowed_index.get(name.strip().casefold())
+        if not entity or entity.entity_id in seen:
+            continue
+        validated_ids.append(entity.entity_id)
+        seen.add(entity.entity_id)
+    return validated_ids
+
+
+def _validate_selected_document_type(
+    selected_name: str | None,
+    allowed_document_types: Sequence[NamedEntity],
+) -> int | None:
+    if not selected_name:
+        return None
+    allowed_index = _build_name_index(allowed_document_types)
+    entity = allowed_index.get(selected_name.strip().casefold())
+    if not entity:
+        return None
+    return entity.entity_id
+
+
+def _extract_existing_tag_ids(document: dict[str, Any]) -> list[int]:
+    tags = document.get("tags")
+    if not isinstance(tags, list):
+        return []
+
+    tag_ids: list[int] = []
+    for item in tags:
+        if isinstance(item, int):
+            tag_ids.append(item)
+            continue
+        if isinstance(item, dict) and isinstance(item.get("id"), int):
+            tag_ids.append(item["id"])
+    return tag_ids
+
+
+async def _update_document(
+    doc_id: int,
+    *,
+    content: str,
+    title: str | None,
+    tag_ids: Sequence[int] | None,
+    document_type_id: int | None,
+) -> None:
     url = f"{PAPERLESS_BASE_URL}/api/documents/{doc_id}/"
     headers = {
-        "Authorization": f"Token {PAPERLESS_API_TOKEN}",
+        **_paperless_headers(),
         "Content-Type": "application/json",
     }
-    payload = {"content": content}
+    payload: dict[str, Any] = {"content": content}
     if title:
         payload["title"] = title
-    resp = await client.patch(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    if tag_ids is not None:
+        payload["tags"] = list(tag_ids)
+    if document_type_id is not None:
+        payload["document_type"] = document_type_id
+
+    resp = await _require_client().patch(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
     resp.raise_for_status()
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global client, ocr_engine
-    timeout = httpx.Timeout(REQUEST_TIMEOUT)
+    global client
+    timeout = httpx.Timeout(max(REQUEST_TIMEOUT, LLM_REQUEST_TIMEOUT))
     client = httpx.AsyncClient(timeout=timeout)
-    loop = asyncio.get_running_loop()
-    ocr_engine = await loop.run_in_executor(
-        None, lambda: PaddleOCR(use_angle_cls=True, lang=PAPERLESS_LANG)
+    logger.info(
+        "LLM OCR configured ocr_model=%s extract_model=%s",
+        OCR_LLM_CONFIG.model,
+        EXTRACT_LLM_CONFIG.model,
     )
-    logger.info("OCR engine initialized, lang=%s", PAPERLESS_LANG)
 
 
 @app.on_event("shutdown")
@@ -276,8 +632,7 @@ async def healthz() -> dict[str, str]:
 
 @app.post("/paperless-webhook")
 async def paperless_webhook(request: Request) -> JSONResponse:
-    if not client:
-        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    _require_client()
     body = await request.json()
     doc_url = body.get("doc_url") or body.get("url")
     doc_id = _extract_doc_id(doc_url)
@@ -288,35 +643,64 @@ async def paperless_webhook(request: Request) -> JSONResponse:
     try:
         file_bytes, content_type = await _download_document(doc_id)
         images = _images_from_bytes(file_bytes, content_type)
-        texts: list[str] = []
-        for img in images:
-            texts.extend(_ocr_image(img))
-        content = _build_content(texts)
-        logger.info("OCR raw content for doc_id=%s:\n%s", doc_id, content)
-        formatted = await _format_content_with_llm(content)
-        if formatted:
-            content = formatted
-            logger.info(
-                "LLM formatted content for doc_id=%s:\n%s",
-                doc_id,
-                content,
-            )
-        title = await _generate_title_with_llm(content)
-        if title:
-            logger.info("LLM generated title for doc_id=%s title=%s", doc_id, title)
-        else:
-            title = _build_title(texts)
+        page_texts = await _ocr_images_with_llm(images)
+        content = _build_content(page_texts)
+        if not content:
+            raise RuntimeError("OCR returned empty content")
+
         logger.info(
-            "OCR done doc_id=%s lines=%s title=%s content_preview=%s",
+            "LLM OCR done doc_id=%s pages=%s content_preview=%s",
             doc_id,
-            len(content.splitlines()) if content else 0,
-            title,
+            len(page_texts),
             _preview(content),
         )
-        await _update_document(doc_id, content, title)
+
+        document_details, allowed_tags, allowed_document_types = await asyncio.gather(
+            _get_document_details(doc_id),
+            _list_existing_tags(),
+            _list_existing_document_types(),
+        )
+
+        title = _build_fallback_title(content)
+        selected_tag_ids: list[int] = []
+        document_type_id: int | None = None
+        try:
+            metadata = await _extract_metadata_with_llm(
+                content,
+                allowed_tags,
+                allowed_document_types,
+            )
+            title = metadata.title or title
+            selected_tag_ids = _validate_selected_tags(metadata.tags, allowed_tags)
+            document_type_id = _validate_selected_document_type(
+                metadata.document_type,
+                allowed_document_types,
+            )
+            logger.info(
+                "Metadata extracted doc_id=%s title=%s selected_tags=%s document_type_id=%s",
+                doc_id,
+                title,
+                selected_tag_ids,
+                document_type_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Metadata extraction failed for doc_id=%s: %s", doc_id, exc)
+
+        existing_tag_ids = _extract_existing_tag_ids(document_details)
+        merged_tag_ids: list[int] | None = None
+        if selected_tag_ids:
+            merged_tag_ids = sorted(set(existing_tag_ids) | set(selected_tag_ids))
+
+        await _update_document(
+            doc_id,
+            content=content,
+            title=title,
+            tag_ids=merged_tag_ids,
+            document_type_id=document_type_id,
+        )
     except httpx.HTTPStatusError as exc:
-        logger.exception("Paperless API call failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Paperless API call failed") from exc
+        logger.exception("Paperless or LLM API call failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Upstream API call failed") from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to process document %s", doc_id)
         raise HTTPException(status_code=500, detail="OCR processing failed") from exc

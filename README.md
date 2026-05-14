@@ -1,71 +1,177 @@
-# paperless-ngx companion (OCR webhook)
+# paperless-ngx companion
 
-English | [中文](https://github.com/fr0der1c/paperless-ngx-companion?tab=readme-ov-file#%E6%A6%82%E8%BF%B0)
+English | 中文
 
 ## Overview
-Paperless-ngx is a great self-hosted DMS, but its built-in Tesseract OCR can be limited. PaddleOCR offers stronger recognition, and an LLM can produce better titles and fix OCR formatting issues. This project uses Paperless-ngx native Workflow + Webhook to attach external OCR and overwrite the built-in OCR result.
+This project is a lightweight FastAPI service that uses Paperless-ngx Workflow + Webhook to transparently replace the built-in OCR and metadata extraction path with a single multimodal LLM pipeline.
 
-This is a lightweight FastAPI service that listens to the Paperless-ngx “Document Added” webhook, downloads the original file, runs PaddleOCR for text, optionally uses an LLM to generate a title (and reformat OCR line breaks/spacing), then PATCHes `content/title` back via the Paperless REST API.
+Once a `Document Added` webhook is configured, the service will:
 
-## Features
-- Receive webhook at `/paperless-webhook`, extract `doc_id` from `doc_url`.
-- Download original file (`/api/documents/{id}/download/?original=true`).
-- Auto-detect PDF vs. image; for PDF, convert to images via pdf2image (poppler).
-- Run PaddleOCR once per process (configurable language).
-- Build full text; optional LLM title generation; optional LLM-based line-break/spacing fix (no semantic changes); PATCH back to Paperless.
-- Health check at `/healthz`.
+1. download the original document from Paperless-ngx
+2. render PDF pages to images when needed
+3. run multimodal LLM OCR
+4. extract `title`, `tags`, and `document_type` from the OCR result
+5. PATCH the final metadata back to Paperless-ngx in one pass
+
+The goal is "configure once, then fully automatic forever". No manual relabeling, no staged automation chain, no workflow-control tags.
+
+## Why This Project Exists
+Paperless-ngx is an excellent self-hosted DMS, but its built-in OCR and downstream metadata enrichment may not be enough if you want a fully LLM-driven pipeline.
+
+This project is designed for a different goal than generic AI add-ons:
+
+- use multimodal LLMs for OCR itself, not just post-processing
+- complete OCR and metadata extraction in one webhook-driven pass
+- update Paperless-ngx automatically without user intervention
+- avoid polluting the tag system with workflow-state labels
+- behave like a transparent external replacement for the built-in capability
+
+## Why Not `paperless-gpt`
+`paperless-gpt` is not aimed at this "single webhook, fully automatic, transparent replacement" workflow.
+
+For this use case, the main problems are:
+
+- it typically depends on custom tags as control signals, so users or automations must keep moving documents through stages manually
+- it does not provide a single built-in path that completes OCR plus title/tag/document-type extraction in one pass
+- if you try to chain multiple Paperless automations together to simulate this flow, document updates can retrigger later steps and easily lead to infinite loops
+
+This project takes the opposite approach:
+
+- only one webhook trigger is needed
+- OCR, title extraction, tag selection, and document type selection happen in one request
+- the service updates Paperless-ngx once with the final result
+- tags are treated as business metadata only, never as workflow-state markers
+
+## Feature Summary
+- Receive webhook at `POST /paperless-webhook`
+- Extract `doc_id` from `doc_url` or `url`
+- Download original file from `/api/documents/{id}/download/?original=true`
+- Auto-detect PDF vs image and convert PDFs with `pdf2image`
+- Run multimodal LLM OCR through an OpenAI-compatible API
+- Extract `title`, `tags`, and `document_type` from OCR text
+- Only choose from existing Paperless tags and existing document types
+- Single PATCH back to Paperless-ngx
+- Health check at `GET /healthz`
+
+## Important Behavior
+- `tags` are never auto-created
+- `document_type` is never auto-created
+- the model is only allowed to choose from the existing tag/type lists fetched from Paperless-ngx
+- if no suitable tag exists, the model must return `[]`
+- if no suitable document type exists, the model must return `null`
+- no workflow-control tags such as `ocr-done`, `needs-tagging`, or similar are introduced
 
 ## Requirements
-- Docker build uses `python:3.10-slim`, installs `poppler-utils`, `libgl1`, `libglib2.0-0`.
-- Internet access to pull Python wheels during build (paddleocr, paddlepaddle, pdf2image etc.).
-- Paperless-ngx API token (Token Auth).
+- Python 3.10+
+- `poppler-utils` for PDF to image conversion
+- a Paperless-ngx API token
+- an OpenAI-compatible API endpoint for chat completions
+- the OCR endpoint must support multimodal / vision input via `image_url`
+- `uv` for local dependency management and lockfile-driven installs
 
-## Environment variables
-- `PAPERLESS_BASE_URL` (required): e.g. `http://webserver:8000`
-- `PAPERLESS_API_TOKEN` (required): Paperless API token (Authorization: Token …)
-- `PAPERLESS_LANG` (optional): PaddleOCR language code, default `ch`.
-- `LOG_LEVEL` (optional): logging level, default `INFO`.
-- `LLM_ENABLED` (optional): `true/false`, default `false`.
-- `LLM_API_BASE` (optional): OpenAI-compatible base URL, default `https://api.openai.com/v1`.
-- `LLM_API_KEY` (optional): API key; required if LLM is enabled.
-- `LLM_MODEL` (optional): model name, default `gpt-4.1-2025-04-14` (override if you have a faster/cheaper variant).
-- `LLM_FORMAT_CONTENT` (optional): `true/false`, default `false`; when true, LLM will reformat OCR text (line breaks/spacing) without changing meaning. Complex layouts may lose fragments. Leave disabled if you only need keyword search; enable if you prioritize readability.
+## Dependency Management
+This project uses `pyproject.toml` + `uv.lock` as the single source of truth for Python dependencies.
 
-## Build and run (Docker)
+- edit dependencies in `pyproject.toml`
+- refresh the lockfile with `uv lock`
+- install locally with `uv sync --locked`
+- Docker builds also install from `uv.lock`
+
+`requirements.txt` is intentionally not used, to avoid manual drift between multiple dependency manifests.
+
+## Environment Variables
+### Required
+- `PAPERLESS_BASE_URL`: for example `http://webserver:8000`
+- `PAPERLESS_API_TOKEN`: Paperless-ngx API token
+- `LLM_API_KEY`: default API key for OpenAI-compatible calls
+
+### General LLM Defaults
+- `LLM_API_BASE`: default OpenAI-compatible base URL, default `https://api.openai.com/v1`
+- `LLM_MODEL`: default model name, default `gpt-4.1-2025-04-14`
+
+### OCR-Specific Overrides
+- `LLM_OCR_API_BASE`: optional dedicated OCR base URL
+- `LLM_OCR_API_KEY`: optional dedicated OCR API key
+- `LLM_OCR_MODEL`: optional dedicated OCR model
+- `LLM_OCR_MAX_TOKENS`: default `4096`
+- `LLM_OCR_IMAGE_MAX_SIZE`: default `2048`
+- `LLM_OCR_IMAGE_DETAIL`: default `high`
+
+### Extraction-Specific Overrides
+- `LLM_EXTRACT_API_BASE`: optional dedicated extraction base URL
+- `LLM_EXTRACT_API_KEY`: optional dedicated extraction API key
+- `LLM_EXTRACT_MODEL`: optional dedicated extraction model
+- `LLM_EXTRACT_INPUT_CHAR_LIMIT`: default `12000`
+- `LLM_EXTRACT_MAX_TOKENS`: default `1200`
+
+### Runtime Controls
+- `LOG_LEVEL`: default `INFO`
+- `REQUEST_TIMEOUT`: default `30`
+- `LLM_REQUEST_TIMEOUT`: default `120`
+- `LLM_PAGE_CONCURRENCY`: default `2`
+- `LLM_MAX_PAGES`: default `20`
+- `PAPERLESS_PAGE_SIZE`: default `1000`
+
+## Build and Run
+### Local
+```sh
+uv sync --locked
+uv run uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+### Docker
+```sh
+docker build -t paperless-ngx-companion .
+
+docker run -p 8000:8000 \
+  -e PAPERLESS_BASE_URL=http://webserver:8000 \
+  -e PAPERLESS_API_TOKEN=YOUR_TOKEN \
+  -e LLM_API_BASE=https://api.openai.com/v1 \
+  -e LLM_API_KEY=YOUR_LLM_KEY \
+  -e LLM_MODEL=gpt-4.1-2025-04-14 \
+  paperless-ngx-companion
+```
+
+### Example with Separate OCR and Extraction Models
 ```sh
 docker run -p 8000:8000 \
   -e PAPERLESS_BASE_URL=http://webserver:8000 \
   -e PAPERLESS_API_TOKEN=YOUR_TOKEN \
-  -e PAPERLESS_LANG=ch \
-  fr0der1c/paperless-ocr:latest
+  -e LLM_API_KEY=DEFAULT_KEY \
+  -e LLM_OCR_API_BASE=https://your-vision-endpoint/v1 \
+  -e LLM_OCR_MODEL=gpt-4.1 \
+  -e LLM_EXTRACT_API_BASE=https://your-text-endpoint/v1 \
+  -e LLM_EXTRACT_MODEL=gpt-4.1-mini \
+  paperless-ngx-companion
 ```
 
-## Paperless workflow setup
-1. Create a workflow with trigger **Document Added**.
-2. Action: **Webhook**.
-3. URL: `http://<host>:8000/paperless-webhook`
-4. Body: JSON including `doc_url` (or `url`), e.g.
-   ```json
-   {
-     "doc_url": "{{doc_url}}"
-   }
-   ```
-5. The service will parse `doc_url` for `/documents/{id}/`, download the original file, run OCR, and PATCH `content`/`title`.
+## Paperless Workflow Setup
+1. Create a workflow with trigger **Document Added**
+2. Add action **Webhook**
+3. Set URL to `http://<host>:8000/paperless-webhook`
+4. Use JSON body:
 
-## Endpoints
-- `POST /paperless-webhook`: main entrypoint.
-- `GET /healthz`: returns `{"status": "ok"}`.
+```json
+{
+  "doc_url": "{{doc_url}}"
+}
+```
 
-## Add to your paperless-ngx docker-compose
-Place this service in the same Docker network as Paperless (`webserver` below is the Paperless API host). If you build locally from this repo:
+After that, every newly added document will go through the external LLM OCR pipeline automatically.
+
+## Docker Compose Example
 ```yaml
 services:
   ocr-service:
-    image: fr0der1c/paperless-ocr:latest   # or build: ./paperless-ngx-paddleocr if you prefer local build
+    build: .
     environment:
       PAPERLESS_BASE_URL: http://webserver:8000
       PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
-      PAPERLESS_LANG: ch
+      LLM_API_BASE: ${LLM_API_BASE}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_OCR_MODEL: ${LLM_OCR_MODEL}
+      LLM_EXTRACT_MODEL: ${LLM_EXTRACT_MODEL}
     depends_on:
       - webserver
     restart: unless-stopped
@@ -74,85 +180,202 @@ services:
 
 networks:
   paperless:
-    external: true   # reuse the network where Paperless runs; or omit if you use the default project network
+    external: true
 ```
-Then configure the Paperless workflow webhook URL as `http://ocr-service:8000/paperless-webhook`.
+
+## Local OCR Debugging
+You can test OCR locally against an image or PDF:
+
+```sh
+uv run python local_ocr_test.py /path/to/file.pdf
+```
+
+The script uses the same LLM OCR path as the webhook service.
 
 ## Notes
-- Title generation: basic fallback is first non-empty line (80 chars); enable LLM for better titles.
-- If you add a second workflow with trigger **Document Updated**, add a tag or custom field filter to avoid self-trigger loops.
-- The service expects Paperless API token and base URL; missing configuration will return 500/503.
-- LLM: enable with `LLM_ENABLED=true`; `LLM_FORMAT_CONTENT=true` lets the LLM fix line breaks/spacing without changing meaning; failures fall back to OCR text/title.
+- The service only supports OpenAI-compatible APIs
+- For OCR, the endpoint must support multimodal input with `image_url`
+- Metadata extraction is best-effort; if extraction fails, OCR content is still written back
+- Title falls back to the first non-empty OCR line if extraction does not return a usable title
+- Tags are appended conservatively by merging with the document's existing tags
+- If no suitable existing tag or document type is found, the corresponding field is skipped
 
 ---
 
 # paperless-ngx companion
 
 ## 概述
-Paperless-ngx 是一个优秀的自托管文档管理系统。其内置的 Tesseract OCR 识别效果有限。PaddleOCR 具有更强的识别能力，LLM 可生成更好的标题并修正OCR排版问题。本项目通过 paperless-ngx 原生的 Workflow 和 Webhook 能力，将外部 OCR 能力挂载到 Paperless-ngx，覆盖内置 OCR 的内容。
+这是一个基于 FastAPI 的轻量服务，通过 Paperless-ngx 的 Workflow + Webhook，把文档处理链路改造成“纯 LLM、多模态 OCR、一次性元数据抽取并回写”的模式。
 
-本服务是基于 FastAPI 的轻量服务，接收 Paperless-ngx Workflow Webhook（Document Added 事件），下载原文件，用 PaddleOCR 识别文本，可选用 LLM 生成标题，通过 REST API 回写 Paperless 的 `content/title` 字段。
+当你配置好 `Document Added -> Webhook` 之后，服务会自动完成：
 
+1. 从 Paperless-ngx 下载原始文档
+2. 如果是 PDF，则转成图片页
+3. 使用多模态大模型执行 OCR
+4. 基于 OCR 文本抽取 `title`、`tags`、`document_type`
+5. 一次性 PATCH 回写到 Paperless-ngx
 
-## 功能
-- `/paperless-webhook` 接收 webhook，从 `doc_url` 提取 `doc_id`。
-- 下载原始文件（`/api/documents/{id}/download/?original=true`）。
-- 自动区分 PDF 与图片，PDF 经 pdf2image（poppler）转图后识别。
-- PaddleOCR 进程级初始化一次（语言可配置）。
-- 拼接全文，可选使用 LLM 修正换行/空格后生成最终 content，取首个非空行或 LLM 生成标题（最长 80 字），PATCH 回 Paperless。
-- `/healthz` 健康检查。
+目标是：**配置一次，然后完全自动化运行**。不依赖人工改标签，不依赖多段自动化链式推进，也不引入流程控制标签。
 
-## 依赖环境
-- Docker 基于 `python:3.10-slim`，安装 `poppler-utils`、`libgl1`、`libglib2.0-0`。
-- 构建阶段需能下载 Python 依赖（paddleocr、paddlepaddle、pdf2image 等）。
-- 需要 Paperless-ngx 的 API Token（Token Auth）。
+## 为什么会有这个项目
+Paperless-ngx 本身已经很好用，但如果你想要的是：
+
+- OCR 本身就由多模态 LLM 完成
+- OCR、标题、标签、分类在一次处理里完成
+- 用户只配置一次 webhook，后面完全自动化
+- 对使用者来说像是“透明替换了 Paperless 的内部能力”
+
+那么单纯在后处理阶段接一点 AI 能力还不够。
+
+这个项目的目标不是给 Paperless 再套一层复杂 AI 工作流，而是把整个 OCR 与元数据更新过程收敛成一个 webhook 闭环。
+
+## 为什么不是 `paperless-gpt`
+`paperless-gpt` 并不是为这个“单 webhook、完全自动、透明替换式”的场景设计的。
+
+在这个场景下，它的几个问题比较明显：
+
+- 它依赖自定义标签来推进处理阶段，通常需要用户手动打标，或者让自动化反复改标签
+- 它不适合在一次流程里同时完成 OCR、标题提取、标签提取、分类提取并最终回写
+- 如果试图通过 Paperless 的自动化链式串联这些步骤，文档更新很容易再次触发后续动作，最终形成无限循环
+
+本项目采用完全相反的思路：
+
+- 只需要一个 webhook 触发
+- OCR、标题抽取、标签选择、分类选择都在一次请求里完成
+- 最后只对 Paperless-ngx 做一次最终更新
+- 标签只表示文档语义，不承担流程状态控制作用
+
+## 功能摘要
+- `POST /paperless-webhook` 接收 webhook
+- 从 `doc_url` 或 `url` 中提取 `doc_id`
+- 下载 `/api/documents/{id}/download/?original=true`
+- 自动识别 PDF / 图片，PDF 使用 `pdf2image` 转图
+- 通过 OpenAI-compatible 接口执行多模态 LLM OCR
+- 基于 OCR 文本抽取 `title`、`tags`、`document_type`
+- 标签和分类都只会从 Paperless 已有项目中选择
+- 一次性 PATCH 回写到 Paperless-ngx
+- `GET /healthz` 健康检查
+
+## 关键行为约束
+- **绝不自动创建标签**
+- **绝不自动创建 document type**
+- 模型只能从 Paperless 当前已有标签列表中选择标签
+- 如果没有合适标签，必须返回 `[]`
+- 模型只能从当前已有 document type 列表中选择分类
+- 如果没有合适分类，必须返回 `null`
+- 不引入任何流程驱动标签，例如 `ocr-done`、`needs-tagging`
+
+## 依赖要求
+- Python 3.10+
+- `poppler-utils`，用于 PDF 转图片
+- Paperless-ngx API Token
+- 一个 OpenAI-compatible 的聊天补全接口
+- OCR 所使用的接口必须支持多模态 / 视觉输入，也就是支持 `image_url`
+- 本地依赖管理使用 `uv`
+
+## 依赖管理
+本项目以 `pyproject.toml + uv.lock` 作为 Python 依赖的唯一真相来源。
+
+- 修改依赖时只改 `pyproject.toml`
+- 用 `uv lock` 更新锁文件
+- 本地通过 `uv sync --locked` 安装
+- Docker 构建也直接基于 `uv.lock` 安装
+
+项目里不再使用 `requirements.txt`，避免出现多份依赖声明手动同步而导致漂移。
 
 ## 环境变量
-- `PAPERLESS_BASE_URL`（必填）：如 `http://webserver:8000`
-- `PAPERLESS_API_TOKEN`（必填）：Paperless API token（Authorization: Token …）
-- `PAPERLESS_LANG`（可选）：PaddleOCR 语言代码，默认 `ch`
-- `LOG_LEVEL`（可选）：日志级别，默认 `INFO`
-- `LLM_ENABLED`（可选）：`true/false`，默认 `false`
-- `LLM_API_BASE`（可选）：OpenAI 兼容接口地址，默认 `https://api.openai.com/v1`
-- `LLM_API_KEY`（可选）：大模型 API key（开启 LLM 时必填）
-- `LLM_MODEL`（可选）：模型名称，默认 `gpt-4.1-2025-04-14`（可按需改更快/更便宜的）
-- `LLM_FORMAT_CONTENT`（可选）：`true/false`，默认 `false`；开启后 LLM 会在保持原意的前提下纠正 OCR 文本的换行/空格，对于复杂排版有可能造成部分文字丢失。如果OCR只是为了搜索关键词，则不建议开启。如果重视内容可读性则可尝试开启。
+### 必填
+- `PAPERLESS_BASE_URL`：例如 `http://webserver:8000`
+- `PAPERLESS_API_TOKEN`：Paperless-ngx API Token
+- `LLM_API_KEY`：默认的大模型 API Key
 
-## 构建与运行（Docker）
+### 全局默认模型配置
+- `LLM_API_BASE`：默认 OpenAI-compatible Base URL，默认 `https://api.openai.com/v1`
+- `LLM_MODEL`：默认模型名，默认 `gpt-4.1-2025-04-14`
+
+### OCR 专用覆盖配置
+- `LLM_OCR_API_BASE`：可选，OCR 专用 Base URL
+- `LLM_OCR_API_KEY`：可选，OCR 专用 API Key
+- `LLM_OCR_MODEL`：可选，OCR 专用模型
+- `LLM_OCR_MAX_TOKENS`：默认 `4096`
+- `LLM_OCR_IMAGE_MAX_SIZE`：默认 `2048`
+- `LLM_OCR_IMAGE_DETAIL`：默认 `high`
+
+### 抽取专用覆盖配置
+- `LLM_EXTRACT_API_BASE`：可选，抽取专用 Base URL
+- `LLM_EXTRACT_API_KEY`：可选，抽取专用 API Key
+- `LLM_EXTRACT_MODEL`：可选，抽取专用模型
+- `LLM_EXTRACT_INPUT_CHAR_LIMIT`：默认 `12000`
+- `LLM_EXTRACT_MAX_TOKENS`：默认 `1200`
+
+### 运行控制
+- `LOG_LEVEL`：默认 `INFO`
+- `REQUEST_TIMEOUT`：默认 `30`
+- `LLM_REQUEST_TIMEOUT`：默认 `120`
+- `LLM_PAGE_CONCURRENCY`：默认 `2`
+- `LLM_MAX_PAGES`：默认 `20`
+- `PAPERLESS_PAGE_SIZE`：默认 `1000`
+
+## 构建与运行
+### 本地
+```sh
+uv sync --locked
+uv run uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+### Docker
+```sh
+docker build -t paperless-ngx-companion .
+
+docker run -p 8000:8000 \
+  -e PAPERLESS_BASE_URL=http://webserver:8000 \
+  -e PAPERLESS_API_TOKEN=YOUR_TOKEN \
+  -e LLM_API_BASE=https://api.openai.com/v1 \
+  -e LLM_API_KEY=YOUR_LLM_KEY \
+  -e LLM_MODEL=gpt-4.1-2025-04-14 \
+  paperless-ngx-companion
+```
+
+### 使用不同 OCR / 抽取模型的示例
 ```sh
 docker run -p 8000:8000 \
   -e PAPERLESS_BASE_URL=http://webserver:8000 \
   -e PAPERLESS_API_TOKEN=YOUR_TOKEN \
-  -e PAPERLESS_LANG=ch \
-  paperless-ocr
+  -e LLM_API_KEY=DEFAULT_KEY \
+  -e LLM_OCR_API_BASE=https://your-vision-endpoint/v1 \
+  -e LLM_OCR_MODEL=gpt-4.1 \
+  -e LLM_EXTRACT_API_BASE=https://your-text-endpoint/v1 \
+  -e LLM_EXTRACT_MODEL=gpt-4.1-mini \
+  paperless-ngx-companion
 ```
 
 ## Paperless 工作流配置
-1. 新建 Workflow，触发器选 **Document Added**。
-2. 动作选 **Webhook**。
-3. URL: `http://<host>:8000/paperless-webhook`
-4. Body 选 JSON，包含 `doc_url`（或 `url`），示例：
-   ```json
-   {
-     "doc_url": "{{doc_url}}"
-   }
-   ```
-5. 服务会从 `doc_url` 解析 `/documents/{id}/`，下载原文件，OCR 后 PATCH 回 `content/title`。
+1. 新建 Workflow，触发器选择 **Document Added**
+2. 添加动作 **Webhook**
+3. URL 填写 `http://<host>:8000/paperless-webhook`
+4. Body 选择 JSON，内容如下：
 
-## 接口
-- `POST /paperless-webhook`: 主入口
-- `GET /healthz`: 返回 `{"status": "ok"}`
+```json
+{
+  "doc_url": "{{doc_url}}"
+}
+```
 
-## 如何加入你的 paperless-ngx docker-compose
-让该服务与 Paperless 处于同一网络（下方 `webserver` 为 Paperless API 主机）。如果从当前仓库构建：
+配置完成后，新文档会自动进入外部 LLM OCR 流程。
+
+## Docker Compose 示例
 ```yaml
 services:
   ocr-service:
-    image: fr0der1c/paperless-ocr:latest   # or build: ./paperless-ngx-paddleocr if you prefer local build
+    build: .
     environment:
       PAPERLESS_BASE_URL: http://webserver:8000
       PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
-      PAPERLESS_LANG: ch
+      LLM_API_BASE: ${LLM_API_BASE}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_OCR_MODEL: ${LLM_OCR_MODEL}
+      LLM_EXTRACT_MODEL: ${LLM_EXTRACT_MODEL}
     depends_on:
       - webserver
     restart: unless-stopped
@@ -161,13 +384,20 @@ services:
 
 networks:
   paperless:
-    external: true   # 复用 Paperless 所在网络；若使用默认项目网络可省略
+    external: true
 ```
-然后在 Paperless Workflow 的 Webhook URL 中填写 `http://ocr-service:8000/paperless-webhook`。
+
+## 本地 OCR 调试
+可以直接对本地图片或 PDF 跑同一套 LLM OCR 流程：
+
+```sh
+uv run python local_ocr_test.py /path/to/file.pdf
+```
 
 ## 说明
-- 标题生成策略很简单（首个非空行截断 80 字符）；可按需扩展（LLM、标签生成等）。
-- 若再用 **Document Updated** 触发，请加标签或自定义字段过滤，避免自触发循环。
-- 缺少 API Token 或 Base URL 将返回 500/503，请确保环境变量配置正确。
-- LLM 生成标题：设置 `LLM_ENABLED=true`，并提供 `LLM_API_KEY`（可选改 `LLM_API_BASE` 和 `LLM_MODEL`，默认 `https://api.openai.com/v1` 与 `gpt-4.1-2025-04-14`）。失败会回退到 OCR 首行标题。
-- LLM 修正排版：设置 `LLM_FORMAT_CONTENT=true`（需同时开启 `LLM_ENABLED`），仅修正换行/空格，不改语义；失败回退原 OCR 文本。
+- 本项目只兼容 OpenAI-compatible 接口
+- OCR 所用接口必须支持 `image_url` 形式的多模态输入
+- 元数据抽取是 best-effort；即使抽取失败，也会尽量把 OCR 文本回写
+- `title` 提取失败时，会回退到 OCR 的第一条非空文本
+- 标签采用保守并集策略：保留文档原有标签，再附加本次成功匹配到的已有标签
+- 如果不存在合适的已有标签或已有分类，则对应字段跳过更新
