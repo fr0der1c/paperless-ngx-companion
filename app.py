@@ -7,7 +7,6 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
-from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -156,18 +155,21 @@ def _paperless_headers() -> dict[str, str]:
     return {"Authorization": f"Token {PAPERLESS_API_TOKEN}"}
 
 
-def _coerce_optional_int(value: Any) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
+def _extract_doc_id(doc_url: str | None) -> int | None:
+    if not doc_url:
+        return None
+    match = re.search(r"/documents/(\d+)/", doc_url)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
-def _extract_doc_id_from_payload(payload: dict[str, Any]) -> int | None:
-    doc_id = _coerce_optional_int(payload.get("doc_id"))
-    if doc_id and doc_id > 0:
-        return doc_id
+def _coerce_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
     return None
 
 
@@ -176,35 +178,15 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
     content_length = request.headers.get("content-length") or "unknown"
 
     if content_type in {"multipart/form-data", "application/x-www-form-urlencoded"}:
-        try:
-            form = await request.form()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to parse form webhook payload content_type=%s content_length=%s error=%s",
-                content_type,
-                content_length,
-                exc,
-            )
-            raise HTTPException(status_code=400, detail="invalid form webhook payload") from exc
-
-        payload: dict[str, Any] = {}
-        file_keys: list[str] = []
-        for key, value in form.multi_items():
-            if isinstance(value, str):
-                payload[key] = value
-                continue
-            file_keys.append(key)
-
-        logger.info(
-            "Webhook payload parsed as form content_type=%s content_length=%s field_keys=%s file_keys=%s",
+        logger.warning(
+            "Unsupported webhook payload content_type=%s content_length=%s; send JSON payload with doc_url",
             content_type,
             content_length,
-            sorted(payload.keys()),
-            sorted(set(file_keys)),
         )
-        if payload:
-            return payload
-        raise HTTPException(status_code=400, detail="webhook form payload has no text fields")
+        raise HTTPException(
+            status_code=400,
+            detail="unsupported webhook payload; send JSON payload with doc_url",
+        )
 
     raw_body = await request.body()
 
@@ -237,17 +219,9 @@ async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
                 return payload
             raise HTTPException(status_code=400, detail="webhook JSON payload must be an object")
 
-    form_payload = {
-        key: values[-1] if values else ""
-        for key, values in parse_qs(body_text, keep_blank_values=True).items()
-    }
-    if form_payload:
-        logger.info("Webhook payload parsed as form keys=%s", sorted(form_payload.keys()))
-        return form_payload
-
     raise HTTPException(
         status_code=400,
-        detail="webhook payload must be JSON or form-encoded with doc_id",
+        detail="webhook payload must be JSON with doc_url",
     )
 
 
@@ -721,15 +695,30 @@ async def healthz() -> dict[str, str]:
 async def paperless_webhook(request: Request) -> JSONResponse:
     _require_client()
     body = await _parse_webhook_payload(request)
-    doc_id = _extract_doc_id_from_payload(body)
+    doc_url = _coerce_optional_string(body.get("doc_url"))
+    doc_id = _extract_doc_id(doc_url)
     if not doc_id:
-        logger.warning("doc_id not found in webhook payload keys=%s", sorted(body.keys()))
+        payload_keys = sorted(body.keys())
+        if not payload_keys:
+            logger.warning(
+                "Webhook payload is empty; configure Paperless JSON payload with doc_url"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="webhook payload is empty; configure Paperless JSON payload with doc_url",
+            )
+
+        logger.warning(
+            "doc_url missing or invalid in webhook payload keys=%s doc_url=%s",
+            payload_keys,
+            doc_url,
+        )
         raise HTTPException(
             status_code=400,
-            detail="doc_id not found; configure Paperless webhook parameter doc_id={{doc_id}}",
+            detail="doc_url missing or invalid; configure Paperless JSON payload with doc_url={{ doc_url }}",
         )
 
-    logger.info("Webhook received doc_id=%s", doc_id)
+    logger.info("Webhook received doc_id=%s doc_url=%s", doc_id, doc_url)
     try:
         file_bytes, content_type = await _download_document(doc_id)
         images = _images_from_bytes(file_bytes, content_type)

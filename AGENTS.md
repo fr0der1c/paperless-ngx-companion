@@ -8,6 +8,7 @@
 ## 产品约束
 - 只支持 OpenAI-compatible 接口。
 - OCR 使用的接口必须支持图片输入。
+- Paperless webhook 使用手写 JSON payload，字段为 `doc_url = {{ doc_url }}`；不要改成 webhook 参数表或 `doc_id`。
 - `tags` 只能从 Paperless-ngx 现有标签中选择，绝不自动创建新标签。
 - `document_type` 只能从现有类型中选择，绝不自动创建新类型。
 - 不引入流程驱动标签，例如 `ocr-done`、`needs-tagging`。
