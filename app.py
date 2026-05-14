@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -162,6 +163,56 @@ def _extract_doc_id(doc_url: str | None) -> int | None:
     if not match:
         return None
     return int(match.group(1))
+
+
+def _coerce_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    return None
+
+
+async def _parse_webhook_payload(request: Request) -> dict[str, Any]:
+    raw_body = await request.body()
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+
+    if not raw_body:
+        raise HTTPException(status_code=400, detail="webhook payload is empty")
+
+    body_text = raw_body.decode("utf-8", errors="replace").strip()
+    if not body_text:
+        raise HTTPException(status_code=400, detail="webhook payload is empty")
+
+    if content_type == "application/json" or body_text.startswith("{"):
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Invalid JSON webhook payload content_type=%s body_preview=%s",
+                content_type,
+                _preview(body_text),
+            )
+        else:
+            if isinstance(payload, dict):
+                return payload
+            raise HTTPException(status_code=400, detail="webhook JSON payload must be an object")
+
+    form_payload = {
+        key: values[-1] if values else ""
+        for key, values in parse_qs(body_text, keep_blank_values=True).items()
+    }
+    if form_payload:
+        return form_payload
+
+    if body_text.startswith("http://") or body_text.startswith("https://"):
+        return {"doc_url": body_text}
+
+    raise HTTPException(
+        status_code=400,
+        detail="webhook payload must be JSON, form-encoded, or a raw document URL",
+    )
 
 
 async def _download_document(doc_id: int) -> tuple[bytes, str]:
@@ -633,8 +684,10 @@ async def healthz() -> dict[str, str]:
 @app.post("/paperless-webhook")
 async def paperless_webhook(request: Request) -> JSONResponse:
     _require_client()
-    body = await request.json()
-    doc_url = body.get("doc_url") or body.get("url")
+    body = await _parse_webhook_payload(request)
+    doc_url = _coerce_optional_string(body.get("doc_url")) or _coerce_optional_string(
+        body.get("url")
+    )
     doc_id = _extract_doc_id(doc_url)
     if not doc_id:
         raise HTTPException(status_code=400, detail="doc_id not found")
