@@ -314,7 +314,10 @@ def _is_pdf(data: bytes, content_type: str) -> bool:
 
 def _images_from_bytes(data: bytes, content_type: str) -> list[Image.Image]:
     if _is_pdf(data, content_type):
-        return convert_from_bytes(data)
+        render_size = (
+            LLM_OCR_IMAGE_MAX_SIZE if LLM_OCR_IMAGE_MAX_SIZE > 0 else None
+        )
+        return convert_from_bytes(data, size=render_size)
 
     image = Image.open(io.BytesIO(data))
     image.load()
