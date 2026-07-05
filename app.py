@@ -31,7 +31,7 @@ LLM_OCR_API_BASE = os.getenv("LLM_OCR_API_BASE", "").rstrip("/")
 LLM_OCR_API_KEY = os.getenv("LLM_OCR_API_KEY", "")
 LLM_OCR_MODEL = os.getenv("LLM_OCR_MODEL", "")
 LLM_OCR_MAX_TOKENS = int(os.getenv("LLM_OCR_MAX_TOKENS", "4096"))
-LLM_OCR_IMAGE_MAX_SIZE = int(os.getenv("LLM_OCR_IMAGE_MAX_SIZE", "2048"))
+LLM_OCR_IMAGE_MAX_SIZE = int(os.getenv("LLM_OCR_IMAGE_MAX_SIZE", "4096"))
 LLM_OCR_IMAGE_DETAIL = os.getenv("LLM_OCR_IMAGE_DETAIL", "high")
 
 LLM_EXTRACT_API_BASE = os.getenv("LLM_EXTRACT_API_BASE", "").rstrip("/")
